@@ -5,8 +5,8 @@ These manifests deploy the Flask + MySQL app on a self-managed Kubernetes cluste
 the Flask app reaches it through the `mysql` Service by name.
 
 ## Prerequisites
-- A running Kubernetes cluster with `kubectl` configured (for a kubeadm cluster,
-  see the official guide: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/).
+- A running Kubernetes cluster with `kubectl` configured. Need to build one? Follow
+  **Part 2 — Set up a self-managed cluster with kubeadm** in the [root README](../README.md).
 - Your app image pushed to a registry, and the `image:` field in
   `two-tier-app-deployment.yml` pointed at it.
 

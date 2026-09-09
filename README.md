@@ -67,8 +67,8 @@ Before you begin, make sure you have the following installed:
 
 - **Docker** (and the **Docker Compose** plugin — `docker compose version`)
 - **Git** (optional, for cloning the repository)
-- For the Kubernetes part: a running cluster and **`kubectl`** — either a self-managed
-  cluster (e.g. built with `kubeadm`) or **Amazon EKS** (with the AWS CLI / `eksctl`)
+- For the Kubernetes part: a cluster and **`kubectl`** — either build a self-managed
+  one by following **Part 2** below, or use **Amazon EKS** (with the AWS CLI / `eksctl`)
 
 ---
 
@@ -297,10 +297,238 @@ docker push nitin1094/flaskapp:latest
 
 ---
 
-# Part 2 — Deploy on Kubernetes
+# Part 2 — Set up a self-managed cluster with kubeadm
 
-> **Before you start:** build and push the app image (steps 3 and *Push the image* above),
-> and make sure the `image:` field in the `two-tier-app` manifests points at it.
+No cluster yet? These steps build a **two-node Kubernetes v1.29 cluster** (1 master + 1 worker)
+from plain Ubuntu servers using `kubeadm`, with **containerd** as the container runtime and
+**Calico** as the pod network. Already have a cluster (or using EKS)? Skip to Part 3.
+
+## Prerequisites
+
+- **Ubuntu** OS (Xenial or later)
+- `sudo` privileges
+- Internet access
+- **t2.medium** instance type or higher (2 vCPU / 4 GB RAM minimum)
+
+## AWS setup
+
+1. Ensure that all instances are in the **same Security Group**.
+2. Expose port **6443** in the Security Group to allow worker nodes to join the cluster.
+3. Expose port **22** in the Security Group to allow SSH access to manage the instances.
+
+<details>
+<summary><b>Step-by-step: create the Security Group in the AWS Console</b></summary>
+
+### Step 1: Identify or create a Security Group
+
+1. **Log in to the AWS Management Console** and open the **EC2 Dashboard**.
+2. **Locate Security Groups** — in the left menu under **Network & Security**, click **Security Groups**.
+3. **Create a new Security Group** — click **Create security group** and provide:
+   - **Name**: e.g. `Kubernetes-Cluster-SG`
+   - **Description**: a brief description (mandatory)
+   - **VPC**: select the VPC for your instances (the default is acceptable)
+4. **Add inbound rules**:
+
+   | Purpose | Type | Port range | Source |
+   |---|---|---|---|
+   | SSH access | SSH | `22` | `0.0.0.0/0` (anywhere) or your specific IP |
+   | Kubernetes API | Custom TCP | `6443` | `0.0.0.0/0` (anywhere) or specific IP ranges |
+
+5. **Save the rules** — click **Create security group**.
+
+### Step 2: Select the Security Group when creating instances
+
+When launching your EC2 instances, under **Configure Security Group**, select the existing
+group (`Kubernetes-Cluster-SG`).
+
+> **Note:** Security group settings can be updated later as needed.
+
+</details>
+
+---
+
+## Execute on BOTH the "Master" and "Worker" nodes
+
+**1. Disable swap** — required for Kubernetes to function correctly.
+
+```bash
+sudo swapoff -a
+```
+
+**2. Load the necessary kernel modules** — required for Kubernetes networking.
+
+```bash
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+```
+
+**3. Set sysctl parameters** — lets bridged traffic reach iptables and enables IP forwarding.
+
+```bash
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+sudo sysctl --system
+
+# verify the modules are loaded
+lsmod | grep br_netfilter
+lsmod | grep overlay
+```
+
+**4. Install containerd** — the container runtime Kubernetes will use.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y containerd.io
+
+# use the systemd cgroup driver (required by the kubelet) and a current pause image
+containerd config default | sed -e 's/SystemdCgroup = false/SystemdCgroup = true/' -e 's/sandbox_image = "registry.k8s.io\/pause:3.6"/sandbox_image = "registry.k8s.io\/pause:3.9"/' | sudo tee /etc/containerd/config.toml
+
+sudo systemctl restart containerd
+sudo systemctl status containerd
+```
+
+**5. Install the Kubernetes components** — `kubelet`, `kubeadm` and `kubectl` (v1.29).
+
+```bash
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+
+# pin the versions so an apt upgrade can't break the cluster
+sudo apt-mark hold kubelet kubeadm kubectl
+```
+
+> **Everything above must run on every node**, and the versions must match. A
+> kubelet/kubeadm version mismatch between master and worker is a common cause of a
+> failed `kubeadm join`.
+
+---
+
+## Execute ONLY on the "Master" node
+
+**1. Initialize the cluster** — bootstraps the control plane.
+
+```bash
+sudo kubeadm init
+```
+
+**2. Set up your local kubeconfig** so `kubectl` can talk to the cluster.
+
+```bash
+mkdir -p "$HOME"/.kube
+sudo cp -i /etc/kubernetes/admin.conf "$HOME"/.kube/config
+sudo chown "$(id -u)":"$(id -g)" "$HOME"/.kube/config
+```
+
+**3. Install a network plugin (Calico)** — until a CNI is installed, nodes stay `NotReady`.
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.0/manifests/calico.yaml
+```
+
+**4. Generate the join command** for your worker nodes.
+
+```bash
+kubeadm token create --print-join-command
+```
+
+> Copy the printed `kubeadm join ...` command — you need it on every worker node.
+
+---
+
+## Execute on ALL of your "Worker" nodes
+
+**1. Reset any previous cluster state** (only needed if the node was joined before):
+
+```bash
+sudo kubeadm reset -f
+```
+
+**2. Paste the join command** you copied from the master, adding `sudo` at the front and
+`--v=5` at the end for verbose output:
+
+```bash
+sudo kubeadm join <private-ip-of-control-plane>:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --cri-socket "unix:///run/containerd/containerd.sock" \
+  --v=5
+```
+
+In other words:
+
+```bash
+sudo <paste-join-command-here> --v=5
+```
+
+A successful join ends with **"This node has joined the cluster."**
+
+---
+
+## Verify the cluster
+
+On the **master** node:
+
+```bash
+kubectl get nodes
+```
+
+Both nodes should report `STATUS: Ready` and `VERSION: v1.29.x` — one with the
+`control-plane` role and one with `<none>` (the worker):
+
+```
+NAME           STATUS   ROLES           AGE   VERSION
+master-node    Ready    control-plane   5m    v1.29.0
+worker-node    Ready    <none>          2m    v1.29.0
+```
+
+Check that the system pods (including Calico) are running:
+
+```bash
+kubectl get pods -n kube-system
+```
+
+### Troubleshooting the cluster build
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `kubeadm join` hangs or times out | Port **6443** isn't open between the nodes in the Security Group. `--v=5` shows exactly where it stalls. |
+| Nodes stuck in `NotReady` | No CNI installed yet — apply the Calico manifest on the master. |
+| kubelet won't start | Swap is still on (`sudo swapoff -a`), or containerd isn't using the `systemd` cgroup driver (step 4). |
+| `kubeadm join` fails with a cert/token error | Tokens expire after 24h — generate a fresh one on the master with `kubeadm token create --print-join-command`. |
+
+With the cluster `Ready`, continue to Part 3 to deploy the app onto it.
+
+---
+
+# Part 3 — Deploy on Kubernetes
+
+> **Before you start:** have a cluster ready (Part 2, or EKS), build and push the app image
+> (steps 3 and *Push the image* above), and make sure the `image:` field in the
+> `two-tier-app` manifests points at it.
 
 ## On a kubeadm cluster
 
