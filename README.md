@@ -69,7 +69,7 @@ Before you begin, make sure you have the following installed:
 - **Docker** (and the **Docker Compose** plugin — `docker compose version`)
 - **Git** (optional, for cloning the repository)
 - For the Kubernetes part: a cluster and **`kubectl`** — either build a self-managed
-  one with **Part 2 (kubeadm)**, or create a managed **Amazon EKS** cluster with **Part 3**
+  one with **Part 2 (kubeadm)**, or create a managed **Amazon EKS** cluster with **Part 5**
 
 ---
 
@@ -302,8 +302,8 @@ docker push nitin1094/flaskapp:latest
 
 No cluster yet? These steps build a **two-node Kubernetes v1.29 cluster** (1 master + 1 worker)
 from plain Ubuntu servers using `kubeadm`, with **containerd** as the container runtime and
-**Calico** as the pod network. Prefer a *managed* cluster instead? See **Part 3 (EKS)**.
-Already have a cluster? Skip to Part 5.
+**Calico** as the pod network. Prefer a *managed* cluster instead? See **Part 5 (EKS)**.
+Already have a cluster? Skip to Part 4.
 
 ## Prerequisites
 
@@ -522,11 +522,272 @@ kubectl get pods -n kube-system
 | kubelet won't start | Swap is still on (`sudo swapoff -a`), or containerd isn't using the `systemd` cgroup driver (step 4). |
 | `kubeadm join` fails with a cert/token error | Tokens expire after 24h — generate a fresh one on the master with `kubeadm token create --print-join-command`. |
 
-With the cluster `Ready`, continue to Part 5 to deploy the app onto it.
+With the cluster `Ready`, continue to Part 4 to deploy the app onto it.
 
 ---
 
-# Part 3 — Set up an Amazon EKS cluster
+# Part 3 — Helm: install it and package the app as a chart
+
+**Helm** is the package manager for Kubernetes. This part installs Helm and turns the
+Flask tier into a reusable **chart** — an alternative to applying the raw manifests in
+Part 4.
+
+## What is Helm?
+
+Helm is often referred to as the **package manager for Kubernetes**. It lets you define,
+install, and manage even the most complex Kubernetes applications. Helm uses a packaging
+format called **charts**, which include all the resources needed to run an application,
+service, or a complete cloud-native stack inside Kubernetes.
+
+In practice a chart gives you three things the raw YAML doesn't:
+
+- **Templating** — one chart, many environments (`values.yaml` instead of copy-pasted YAML)
+- **Releases** — an install is versioned, so `helm upgrade` / `helm rollback` just work
+- **Packaging** — the whole app ships as a single versioned archive
+
+## Install Helm on Ubuntu
+
+```bash
+curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+sudo apt-get install apt-transport-https --yes
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+sudo apt-get update
+sudo apt-get install helm
+```
+
+Verify the install:
+
+```bash
+helm version
+```
+
+<details>
+<summary>Alternative install methods</summary>
+
+Official install script (any Linux distro):
+
+```bash
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+```
+
+Or via snap:
+
+```bash
+sudo snap install helm --classic
+```
+</details>
+
+> Helm talks to your cluster through the same `~/.kube/config` that `kubectl` uses, so
+> install it wherever you run `kubectl` (the master node, or your control machine).
+
+## Essential Helm commands
+
+| Command | What it does |
+|---|---|
+| `helm create [CHART]` | Scaffold a new Helm chart |
+| `helm lint [CHART]` | Check a chart for problems before installing |
+| `helm template [NAME] [CHART]` | Render the templates locally without installing |
+| `helm package [CHART]` | Package the chart into a `.tgz` archive |
+| `helm install [NAME] [CHART]` | Install a chart as a named release |
+| `helm upgrade [NAME] [CHART]` | Upgrade an installed release |
+| `helm rollback [NAME] [REVISION]` | Roll a release back to a previous revision |
+| `helm list` | List installed releases |
+| `helm status [NAME]` | Show the status of a release |
+| `helm uninstall [NAME]` | Uninstall a release |
+
+## Prerequisites for the chart
+
+- **Helm** installed (above)
+- A **Kubernetes cluster** and a working `kubectl` (Part 2, Part 5, Minikube or kind)
+- Your app **image pushed** to a registry (Part 1, step 3)
+- The **MySQL tier already running** — the chart below deploys only the Flask tier and
+  expects to reach the database at the `mysql` Service:
+  ```bash
+  kubectl apply -f k8s/mysql-pv.yml -f k8s/mysql-pvc.yml
+  kubectl apply -f k8s/mysql-deployment.yml -f k8s/mysql-svc.yml
+  ```
+
+## Package this app as a Helm chart
+
+### 1. Scaffold the chart
+
+```bash
+helm create flask-app-chart
+```
+
+This creates a `flask-app-chart/` folder with the standard chart structure. Helm's
+default scaffold includes a lot of extras — replace the two templates below and delete
+the rest of `templates/` (including `tests/`) to keep it minimal.
+
+### 2. Chart metadata — `flask-app-chart/Chart.yaml`
+
+```yaml
+apiVersion: v2
+name: flask-app-chart
+description: A Helm chart for the two-tier Flask application
+type: application
+version: 0.1.0
+appVersion: "1.0"
+```
+
+> `version` is the **chart** version; `appVersion` tracks the **application** version.
+
+### 3. Default values — `flask-app-chart/values.yaml`
+
+```yaml
+replicaCount: 1
+
+image:
+  repository: nitin1094/flaskapp
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  port: 5000
+  targetPort: 5000
+  nodePort: 30005
+
+mysql:
+  host: mysql        # the MySQL Service name (cluster DNS resolves it)
+  user: root
+  password: admin
+  database: mydb
+```
+
+> **Why `30005` and not `30004`?** Part 4's `two-tier-app-svc.yml` already claims
+> NodePort `30004`. Using a different port lets the Helm release and the manifest-based
+> deployment coexist; a duplicate `nodePort` would be rejected by the API server.
+
+### 4. Deployment template — `flask-app-chart/templates/deployment.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-deployment
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+          - name: MYSQL_HOST
+            value: "{{ .Values.mysql.host }}"
+          - name: MYSQL_USER
+            value: "{{ .Values.mysql.user }}"
+          - name: MYSQL_PASSWORD
+            value: "{{ .Values.mysql.password }}"
+          - name: MYSQL_DB
+            value: "{{ .Values.mysql.database }}"
+        ports:
+        - containerPort: {{ .Values.service.targetPort }}
+```
+
+### 5. Service template — `flask-app-chart/templates/service.yaml`
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-service
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+  - port: {{ .Values.service.port }}
+    targetPort: {{ .Values.service.targetPort }}
+    nodePort: {{ .Values.service.nodePort }}
+  selector:
+    app: {{ .Release.Name }}
+```
+
+### 6. Check, then install
+
+```bash
+# catch schema/syntax problems first
+helm lint ./flask-app-chart
+
+# see exactly what will be sent to the cluster
+helm template flask-app ./flask-app-chart
+
+# package it into flask-app-chart-0.1.0.tgz (optional)
+helm package flask-app-chart
+
+# install it as a release named "flask-app"
+helm install flask-app ./flask-app-chart
+```
+
+Open the app at `http://<worker-node-ip>:30005/`.
+
+### 7. Inspect, upgrade, roll back, uninstall
+
+```bash
+helm list                                    # all releases
+helm status flask-app                        # one release's status
+kubectl get deploy,svc,pods                  # the objects Helm created
+
+# change a value without editing files, creating revision 2
+helm upgrade flask-app ./flask-app-chart --set replicaCount=3
+
+helm history flask-app                       # see the revisions
+helm rollback flask-app 1                    # back to revision 1
+
+helm uninstall flask-app                     # remove the release
+```
+
+> Overriding values is what makes a chart reusable — `--set image.tag=v2` or
+> `-f prod-values.yaml` deploys the same chart to a different environment.
+
+---
+
+# Part 4 — Deploy on Kubernetes
+
+> **Before you start:** have a cluster ready (Part 2 or Part 5), build and push the app image
+> (steps 3 and *Push the image* above), and make sure the `image:` field in the
+> `two-tier-app` manifests points at it.
+
+This part applies the raw manifests with `kubectl`. For the packaged, templated
+route — same app, installed as a versioned release — see **Part 3 (Helm)**.
+
+## On a kubeadm cluster
+
+```bash
+cd k8s
+kubectl apply -f mysql-pv.yml -f mysql-pvc.yml                          # storage
+kubectl apply -f mysql-deployment.yml -f mysql-svc.yml                  # database
+kubectl apply -f two-tier-app-deployment.yml -f two-tier-app-svc.yml    # app
+kubectl get pods,svc
+# open http://<worker-node-ip>:30004/
+```
+
+See [`k8s/README.md`](k8s/README.md) for the detailed walkthrough.
+
+## On Amazon EKS
+
+> Need the cluster first? **Part 5** creates one with `eksctl`.
+
+```bash
+cd eks-manifests
+kubectl apply -f mysql-configmap.yml -f mysql-secrets.yml
+kubectl apply -f mysql-deployment.yml -f mysql-svc.yml
+kubectl apply -f two-tier-app-deployment.yml -f two-tier-app-svc.yml
+kubectl get svc two-tier-app-service   # wait for the LoadBalancer EXTERNAL-IP, then open it
+```
+
+---
+
+# Part 5 — Set up a managed cluster on Amazon EKS
 
 The managed alternative to Part 2: instead of building a control plane by hand, **AWS runs
 it for you** and `eksctl` provisions the whole cluster (VPC, control plane, worker nodes)
@@ -631,7 +892,7 @@ Two nodes in `STATUS: Ready` means the cluster is live.
 ## 5. Deploy the app
 
 Build and push your image (Part 1, step 3 and *Push the image*), then apply the EKS
-manifests — full details in **Part 5**:
+manifests — full details in **Part 4**:
 
 ```bash
 cd eks-manifests
@@ -714,7 +975,7 @@ eksctl create iamserviceaccount \
   --attach-policy-arn=arn:aws:iam::<your-aws-account-id>:policy/AWSLoadBalancerControllerIAMPolicy \
   --approve --region=us-west-2
 
-# 4) Install the controller with Helm (see Part 4 for installing Helm itself)
+# 4) Install the controller with Helm (see Part 3 for installing Helm itself)
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update eks
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -731,265 +992,6 @@ Replace `<your-aws-account-id>` with your 12-digit AWS account ID, and keep
 `clusterName` matching the cluster you actually created — a wrong cluster name is the
 usual reason no load balancer ever appears.
 </details>
-
----
-
-# Part 4 — Helm: install it and package the app as a chart
-
-**Helm** is the package manager for Kubernetes. This part installs Helm and turns the
-Flask tier into a reusable **chart** — an alternative to applying the raw manifests in
-Part 5.
-
-## What is Helm?
-
-Helm is often referred to as the **package manager for Kubernetes**. It lets you define,
-install, and manage even the most complex Kubernetes applications. Helm uses a packaging
-format called **charts**, which include all the resources needed to run an application,
-service, or a complete cloud-native stack inside Kubernetes.
-
-In practice a chart gives you three things the raw YAML doesn't:
-
-- **Templating** — one chart, many environments (`values.yaml` instead of copy-pasted YAML)
-- **Releases** — an install is versioned, so `helm upgrade` / `helm rollback` just work
-- **Packaging** — the whole app ships as a single versioned archive
-
-## Install Helm on Ubuntu
-
-```bash
-curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-sudo apt-get install apt-transport-https --yes
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-sudo apt-get update
-sudo apt-get install helm
-```
-
-Verify the install:
-
-```bash
-helm version
-```
-
-<details>
-<summary>Alternative install methods</summary>
-
-Official install script (any Linux distro):
-
-```bash
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-chmod 700 get_helm.sh
-./get_helm.sh
-```
-
-Or via snap:
-
-```bash
-sudo snap install helm --classic
-```
-</details>
-
-> Helm talks to your cluster through the same `~/.kube/config` that `kubectl` uses, so
-> install it wherever you run `kubectl` (the master node, or your control machine).
-
-## Essential Helm commands
-
-| Command | What it does |
-|---|---|
-| `helm create [CHART]` | Scaffold a new Helm chart |
-| `helm lint [CHART]` | Check a chart for problems before installing |
-| `helm template [NAME] [CHART]` | Render the templates locally without installing |
-| `helm package [CHART]` | Package the chart into a `.tgz` archive |
-| `helm install [NAME] [CHART]` | Install a chart as a named release |
-| `helm upgrade [NAME] [CHART]` | Upgrade an installed release |
-| `helm rollback [NAME] [REVISION]` | Roll a release back to a previous revision |
-| `helm list` | List installed releases |
-| `helm status [NAME]` | Show the status of a release |
-| `helm uninstall [NAME]` | Uninstall a release |
-
-## Prerequisites for the chart
-
-- **Helm** installed (above)
-- A **Kubernetes cluster** and a working `kubectl` (Part 2, Part 3, Minikube or kind)
-- Your app **image pushed** to a registry (Part 1, step 3)
-- The **MySQL tier already running** — the chart below deploys only the Flask tier and
-  expects to reach the database at the `mysql` Service:
-  ```bash
-  kubectl apply -f k8s/mysql-pv.yml -f k8s/mysql-pvc.yml
-  kubectl apply -f k8s/mysql-deployment.yml -f k8s/mysql-svc.yml
-  ```
-
-## Package this app as a Helm chart
-
-### 1. Scaffold the chart
-
-```bash
-helm create flask-app-chart
-```
-
-This creates a `flask-app-chart/` folder with the standard chart structure. Helm's
-default scaffold includes a lot of extras — replace the two templates below and delete
-the rest of `templates/` (including `tests/`) to keep it minimal.
-
-### 2. Chart metadata — `flask-app-chart/Chart.yaml`
-
-```yaml
-apiVersion: v2
-name: flask-app-chart
-description: A Helm chart for the two-tier Flask application
-type: application
-version: 0.1.0
-appVersion: "1.0"
-```
-
-> `version` is the **chart** version; `appVersion` tracks the **application** version.
-
-### 3. Default values — `flask-app-chart/values.yaml`
-
-```yaml
-replicaCount: 1
-
-image:
-  repository: nitin1094/flaskapp
-  tag: latest
-  pullPolicy: IfNotPresent
-
-service:
-  type: NodePort
-  port: 5000
-  targetPort: 5000
-  nodePort: 30005
-
-mysql:
-  host: mysql        # the MySQL Service name (cluster DNS resolves it)
-  user: root
-  password: admin
-  database: mydb
-```
-
-> **Why `30005` and not `30004`?** Part 5's `two-tier-app-svc.yml` already claims
-> NodePort `30004`. Using a different port lets the Helm release and the manifest-based
-> deployment coexist; a duplicate `nodePort` would be rejected by the API server.
-
-### 4. Deployment template — `flask-app-chart/templates/deployment.yaml`
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ .Release.Name }}-deployment
-spec:
-  replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      app: {{ .Release.Name }}
-  template:
-    metadata:
-      labels:
-        app: {{ .Release.Name }}
-    spec:
-      containers:
-      - name: {{ .Chart.Name }}
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-        imagePullPolicy: {{ .Values.image.pullPolicy }}
-        env:
-          - name: MYSQL_HOST
-            value: "{{ .Values.mysql.host }}"
-          - name: MYSQL_USER
-            value: "{{ .Values.mysql.user }}"
-          - name: MYSQL_PASSWORD
-            value: "{{ .Values.mysql.password }}"
-          - name: MYSQL_DB
-            value: "{{ .Values.mysql.database }}"
-        ports:
-        - containerPort: {{ .Values.service.targetPort }}
-```
-
-### 5. Service template — `flask-app-chart/templates/service.yaml`
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Release.Name }}-service
-spec:
-  type: {{ .Values.service.type }}
-  ports:
-  - port: {{ .Values.service.port }}
-    targetPort: {{ .Values.service.targetPort }}
-    nodePort: {{ .Values.service.nodePort }}
-  selector:
-    app: {{ .Release.Name }}
-```
-
-### 6. Check, then install
-
-```bash
-# catch schema/syntax problems first
-helm lint ./flask-app-chart
-
-# see exactly what will be sent to the cluster
-helm template flask-app ./flask-app-chart
-
-# package it into flask-app-chart-0.1.0.tgz (optional)
-helm package flask-app-chart
-
-# install it as a release named "flask-app"
-helm install flask-app ./flask-app-chart
-```
-
-Open the app at `http://<worker-node-ip>:30005/`.
-
-### 7. Inspect, upgrade, roll back, uninstall
-
-```bash
-helm list                                    # all releases
-helm status flask-app                        # one release's status
-kubectl get deploy,svc,pods                  # the objects Helm created
-
-# change a value without editing files, creating revision 2
-helm upgrade flask-app ./flask-app-chart --set replicaCount=3
-
-helm history flask-app                       # see the revisions
-helm rollback flask-app 1                    # back to revision 1
-
-helm uninstall flask-app                     # remove the release
-```
-
-> Overriding values is what makes a chart reusable — `--set image.tag=v2` or
-> `-f prod-values.yaml` deploys the same chart to a different environment.
-
----
-
-# Part 5 — Deploy on Kubernetes
-
-> **Before you start:** have a cluster ready (Part 2 or Part 3), build and push the app image
-> (steps 3 and *Push the image* above), and make sure the `image:` field in the
-> `two-tier-app` manifests points at it.
-
-This part applies the raw manifests with `kubectl`. For the packaged, templated
-route — same app, installed as a versioned release — see **Part 4 (Helm)**.
-
-## On a kubeadm cluster
-
-```bash
-cd k8s
-kubectl apply -f mysql-pv.yml -f mysql-pvc.yml                          # storage
-kubectl apply -f mysql-deployment.yml -f mysql-svc.yml                  # database
-kubectl apply -f two-tier-app-deployment.yml -f two-tier-app-svc.yml    # app
-kubectl get pods,svc
-# open http://<worker-node-ip>:30004/
-```
-
-See [`k8s/README.md`](k8s/README.md) for the detailed walkthrough.
-
-## On Amazon EKS
-
-```bash
-cd eks-manifests
-kubectl apply -f mysql-configmap.yml -f mysql-secrets.yml
-kubectl apply -f mysql-deployment.yml -f mysql-svc.yml
-kubectl apply -f two-tier-app-deployment.yml -f two-tier-app-svc.yml
-kubectl get svc two-tier-app-service   # wait for the LoadBalancer EXTERNAL-IP, then open it
-```
 
 ---
 
