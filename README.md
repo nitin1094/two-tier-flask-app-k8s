@@ -69,7 +69,7 @@ Before you begin, make sure you have the following installed:
 - **Docker** (and the **Docker Compose** plugin — `docker compose version`)
 - **Git** (optional, for cloning the repository)
 - For the Kubernetes part: a cluster and **`kubectl`** — either build a self-managed
-  one by following **Part 2** below, or use **Amazon EKS** (with the AWS CLI / `eksctl`)
+  one with **Part 2 (kubeadm)**, or create a managed **Amazon EKS** cluster with **Part 3**
 
 ---
 
@@ -302,7 +302,8 @@ docker push nitin1094/flaskapp:latest
 
 No cluster yet? These steps build a **two-node Kubernetes v1.29 cluster** (1 master + 1 worker)
 from plain Ubuntu servers using `kubeadm`, with **containerd** as the container runtime and
-**Calico** as the pod network. Already have a cluster (or using EKS)? Skip to Part 3.
+**Calico** as the pod network. Prefer a *managed* cluster instead? See **Part 3 (EKS)**.
+Already have a cluster? Skip to Part 5.
 
 ## Prerequisites
 
@@ -521,15 +522,223 @@ kubectl get pods -n kube-system
 | kubelet won't start | Swap is still on (`sudo swapoff -a`), or containerd isn't using the `systemd` cgroup driver (step 4). |
 | `kubeadm join` fails with a cert/token error | Tokens expire after 24h — generate a fresh one on the master with `kubeadm token create --print-join-command`. |
 
-With the cluster `Ready`, continue to Part 3 to deploy the app onto it.
+With the cluster `Ready`, continue to Part 5 to deploy the app onto it.
 
 ---
 
-# Part 3 — Helm: install it and package the app as a chart
+# Part 3 — Set up an Amazon EKS cluster
+
+The managed alternative to Part 2: instead of building a control plane by hand, **AWS runs
+it for you** and `eksctl` provisions the whole cluster (VPC, control plane, worker nodes)
+from a single command. Everything is driven from one small EC2 "control machine".
+
+> 💸 **EKS is not free.** You pay for the control plane (~$0.10/hour), the EC2 worker
+> nodes, and any load balancer. Follow the **teardown** step the moment you're done, or
+> it keeps billing.
+
+## 1. Create an IAM user
+
+1. In the AWS Console, create an IAM user named **`eks-admin`** with the
+   **`AdministratorAccess`** policy.
+2. Create **Security Credentials** for it — an **Access key** and **Secret access key**.
+   Keep them somewhere safe; you'll paste them into `aws configure` in step 3.
+
+> `AdministratorAccess` is deliberately broad to keep a learning project moving. For
+> anything real, scope the policy down to the EKS/EC2/IAM actions actually needed — and
+> never commit access keys to Git.
+
+## 2. Launch the control machine (EC2)
+
+1. Launch an **Ubuntu** EC2 instance in your chosen region (e.g. `us-west-2`).
+2. SSH into it from your local machine.
+
+> This instance is **not part of the cluster** — it's just where you run `aws`, `docker`,
+> `kubectl` and `eksctl`. A small instance is fine.
+
+## 3. Install the tooling
+
+**AWS CLI v2**
+
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+sudo apt install unzip
+unzip awscliv2.zip
+sudo ./aws/install -i /usr/local/aws-cli -b /usr/local/bin --update
+aws --version
+```
+
+Then authenticate with the access key from step 1:
+
+```bash
+aws configure
+```
+
+**Docker** — needed to build and push the app image:
+
+```bash
+sudo apt-get update
+sudo apt install docker.io -y
+sudo chown $USER /var/run/docker.sock
+docker ps
+```
+
+**kubectl**
+
+```bash
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin/kubectl
+kubectl version --client
+```
+
+**eksctl**
+
+```bash
+curl --silent --location "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+eksctl version
+```
+
+> Both `kubectl` and `eksctl` are single binaries: download, `chmod +x`, and move onto
+> your `PATH`.
+
+## 4. Create the EKS cluster
+
+```bash
+eksctl create cluster \
+  --name two-tier-cluster \
+  --region us-west-2 \
+  --node-type t2.medium \
+  --nodes-min 2 \
+  --nodes-max 2
+```
+
+`eksctl` builds this via CloudFormation — the control plane first, then the node group —
+which takes roughly **15–20 minutes**.
+
+Point `kubectl` at the new cluster and confirm the nodes are up:
+
+```bash
+aws eks update-kubeconfig --region us-west-2 --name two-tier-cluster
+kubectl get nodes
+```
+
+Two nodes in `STATUS: Ready` means the cluster is live.
+
+> `aws eks update-kubeconfig` writes the cluster's endpoint and auth details into
+> `~/.kube/config`. Without it, `kubectl` has no idea your cluster exists.
+
+## 5. Deploy the app
+
+Build and push your image (Part 1, step 3 and *Push the image*), then apply the EKS
+manifests — full details in **Part 5**:
+
+```bash
+cd eks-manifests
+kubectl apply -f .
+kubectl get pods,svc
+```
+
+The app's Service is `type: LoadBalancer`, so EKS provisions an AWS load balancer for it
+automatically. Watch for the `EXTERNAL-IP` to appear (it takes a few minutes), then open
+it in your browser:
+
+```bash
+kubectl get svc two-tier-app-service
+```
+
+<details>
+<summary>Deploying into a dedicated namespace</summary>
+
+These manifests don't hard-code a `namespace:`, so by default they land in `default`.
+To keep them separate, create a namespace and pass `-n` (the flag is required — creating
+a namespace alone changes nothing):
+
+```bash
+kubectl create namespace two-tier-ns
+kubectl apply -f . -n two-tier-ns
+kubectl get all -n two-tier-ns
+```
+
+Or set it once for your session:
+
+```bash
+kubectl config set-context --current --namespace two-tier-ns
+```
+</details>
+
+## 6. Tear it down — don't skip this
+
+Delete the app **first** so Kubernetes releases the AWS load balancer it created, then
+delete the cluster:
+
+```bash
+kubectl delete -f .                                              # releases the load balancer
+eksctl delete cluster --name two-tier-cluster --region us-west-2  # removes the cluster
+```
+
+Then confirm in the AWS Console that:
+
+- the **load balancer** created by the Service is gone,
+- any **security groups** left over from the steps above are deleted,
+- the **control-machine EC2** from step 2 is stopped or terminated.
+
+> Deleting the cluster before deleting the `LoadBalancer` Service can orphan the AWS load
+> balancer — it survives the cluster and keeps billing. Always remove the app first.
+
+<details>
+<summary><b>Optional:</b> install the AWS Load Balancer Controller (only needed for Ingress)</summary>
+
+This repo exposes the app with a **`type: LoadBalancer`** Service, which EKS satisfies on
+its own — so **you can skip this section**. You only need the controller if you swap that
+Service for an **Ingress** and want a shared Application Load Balancer routing by
+host/path.
+
+```bash
+# 1) Create the IAM policy the controller needs
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.5.4/docs/install/iam_policy.json
+aws iam create-policy \
+  --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://iam_policy.json
+
+# 2) Enable IAM Roles for Service Accounts (OIDC) on the cluster
+eksctl utils associate-iam-oidc-provider \
+  --region=us-west-2 --cluster=two-tier-cluster --approve
+
+# 3) Bind a Kubernetes service account to that policy
+eksctl create iamserviceaccount \
+  --cluster=two-tier-cluster \
+  --namespace=kube-system \
+  --name=aws-load-balancer-controller \
+  --role-name AmazonEKSLoadBalancerControllerRole \
+  --attach-policy-arn=arn:aws:iam::<your-aws-account-id>:policy/AWSLoadBalancerControllerIAMPolicy \
+  --approve --region=us-west-2
+
+# 4) Install the controller with Helm (see Part 4 for installing Helm itself)
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update eks
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=two-tier-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
+
+# 5) Confirm it's running
+kubectl get deployment -n kube-system aws-load-balancer-controller
+```
+
+Replace `<your-aws-account-id>` with your 12-digit AWS account ID, and keep
+`clusterName` matching the cluster you actually created — a wrong cluster name is the
+usual reason no load balancer ever appears.
+</details>
+
+---
+
+# Part 4 — Helm: install it and package the app as a chart
 
 **Helm** is the package manager for Kubernetes. This part installs Helm and turns the
 Flask tier into a reusable **chart** — an alternative to applying the raw manifests in
-Part 4.
+Part 5.
 
 ## What is Helm?
 
@@ -599,7 +808,7 @@ sudo snap install helm --classic
 ## Prerequisites for the chart
 
 - **Helm** installed (above)
-- A **Kubernetes cluster** and a working `kubectl` (Part 2, EKS, Minikube or kind)
+- A **Kubernetes cluster** and a working `kubectl` (Part 2, Part 3, Minikube or kind)
 - Your app **image pushed** to a registry (Part 1, step 3)
 - The **MySQL tier already running** — the chart below deploys only the Flask tier and
   expects to reach the database at the `mysql` Service:
@@ -656,7 +865,7 @@ mysql:
   database: mydb
 ```
 
-> **Why `30005` and not `30004`?** Part 4's `two-tier-app-svc.yml` already claims
+> **Why `30005` and not `30004`?** Part 5's `two-tier-app-svc.yml` already claims
 > NodePort `30004`. Using a different port lets the Helm release and the manifest-based
 > deployment coexist; a duplicate `nodePort` would be rejected by the API server.
 
@@ -750,14 +959,14 @@ helm uninstall flask-app                     # remove the release
 
 ---
 
-# Part 4 — Deploy on Kubernetes
+# Part 5 — Deploy on Kubernetes
 
-> **Before you start:** have a cluster ready (Part 2, or EKS), build and push the app image
+> **Before you start:** have a cluster ready (Part 2 or Part 3), build and push the app image
 > (steps 3 and *Push the image* above), and make sure the `image:` field in the
 > `two-tier-app` manifests points at it.
 
 This part applies the raw manifests with `kubectl`. For the packaged, templated
-route — same app, installed as a versioned release — see **Part 3 (Helm)**.
+route — same app, installed as a versioned release — see **Part 4 (Helm)**.
 
 ## On a kubeadm cluster
 
@@ -792,6 +1001,7 @@ kubectl get svc two-tier-app-service   # wait for the LoadBalancer EXTERNAL-IP, 
 - Two exposure models: **NodePort** on a self-managed cluster vs a cloud **LoadBalancer** on EKS
 - **Persistent storage** (PV/PVC, hostPath) so the database survives pod restarts
 - Managing configuration with **Secrets** and **ConfigMaps** (EKS variant)
+- Provisioning a **managed Amazon EKS** cluster with `eksctl` — IAM/OIDC, node groups, and a clean teardown to control cost
 - Packaging an app as a **Helm chart** — templated `values.yaml`, versioned releases, `upgrade`/`rollback`
 - **CI** with Jenkins: source scan (Trivy) → build → push to a registry → deploy
 
